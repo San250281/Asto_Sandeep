@@ -1,0 +1,96 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile with their current wallet balance and other relevant details.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "wallet_balance": { "type": "number" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "wallet_balance", "created_at"]
+    },
+    "WalletTransaction": {
+      "title": "WalletTransaction",
+      "description": "Represents wallet balance recharge or deduction transactions.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "user_id": { "type": "string" },
+        "amount": { "type": "number" },
+        "type": { "type": "string" },
+        "status": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "user_id", "amount", "type", "status", "created_at"]
+    },
+    "VoiceSession": {
+      "title": "VoiceSession",
+      "description": "An astrology voice session between a user and an AI Astrologer Agent.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "user_id": { "type": "string" },
+        "agent_id": { "type": "string" },
+        "start_time": { "type": "string", "format": "date-time" },
+        "end_time": { "type": "string", "format": "date-time" },
+        "total_seconds": { "type": "number" },
+        "total_amount": { "type": "number" }
+      },
+      "required": ["id", "user_id", "agent_id", "start_time"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A chat or transcript message from a voice session.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "sender": { "type": "string", "enum": ["user", "ai"] },
+        "text": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "session_id", "sender", "text", "timestamp"]
+    },
+    "AiAgent": {
+      "title": "AiAgent",
+      "description": "An AI Astrologer personality configured in the system.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "specialization": { "type": "string" },
+        "price_per_minute": { "type": "number" },
+        "voice_id": { "type": "string" },
+        "personality": { "type": "string" }
+      },
+      "required": ["id", "name", "specialization", "price_per_minute", "personality"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Stores user master records and profiles"
+    },
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": "WalletTransaction",
+      "description": "History of user wallet recharges and deductions"
+    },
+    "/users/{userId}/sessions/{sessionId}": {
+      "schema": "VoiceSession",
+      "description": "Session records of voice interactions"
+    },
+    "/users/{userId}/sessions/{sessionId}/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Transcripts of voice conversations"
+    },
+    "/ai_agents/{agentId}": {
+      "schema": "AiAgent",
+      "description": "Global definitions of available AI Astrologer Agents"
+    }
+  }
+}

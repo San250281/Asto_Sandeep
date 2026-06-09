@@ -1,0 +1,6 @@
+{
+  "name": "Vedic Voice Astrology",
+  "description": "Premium astrology voice platform with custom cloned personalities, per-second billing, and instant wallet recharges.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
