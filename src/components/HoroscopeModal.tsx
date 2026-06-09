@@ -19,9 +19,9 @@ interface HoroscopeData {
   category: string;
   icon: React.ComponentType<any>;
   colorTheme: {
-    primary: string; // Tailwind color name e.g. "amber-500"
-    glow: string;    // e.g. "shadow-amber-500/20"
-    badge: string;   // e.g. "bg-amber-500/10 text-amber-400 border-amber-500/20"
+    textColor: string;  // e.g. "text-amber-500"
+    glow: string;       // e.g. "shadow-amber-500/20"
+    badge: string;      // e.g. "bg-amber-500/10 text-amber-400 border-amber-500/20"
     bgGradient: string; // e.g. "from-amber-950/20 via-slate-900 to-slate-950"
   };
   forecast: string;
@@ -38,7 +38,7 @@ const HOROSCOPES: Record<string, HoroscopeData> = {
     category: "Vedic Karma & Spiritual Alignment",
     icon: Compass,
     colorTheme: {
-      primary: "amber-500",
+      textColor: "text-amber-500",
       glow: "shadow-amber-500/20",
       badge: "bg-amber-500/10 text-amber-400 border-amber-500/20",
       bgGradient: "from-amber-950/40 via-slate-950 to-slate-900",
@@ -55,7 +55,7 @@ const HOROSCOPES: Record<string, HoroscopeData> = {
     category: "Romance, Synastry & Emotional Healing",
     icon: Heart,
     colorTheme: {
-      primary: "pink-500",
+      textColor: "text-pink-500",
       glow: "shadow-pink-500/20",
       badge: "bg-pink-500/10 text-pink-400 border-pink-500/20",
       bgGradient: "from-pink-950/40 via-slate-950 to-slate-900",
@@ -72,7 +72,7 @@ const HOROSCOPES: Record<string, HoroscopeData> = {
     category: "Corporate Career, Business & Wealth Strategy",
     icon: Briefcase,
     colorTheme: {
-      primary: "emerald-500",
+      textColor: "text-emerald-500",
       glow: "shadow-emerald-500/20",
       badge: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
       bgGradient: "from-emerald-950/40 via-slate-950 to-slate-900",
@@ -92,7 +92,7 @@ export default function HoroscopeModal({ isOpen, onClose, agent }: HoroscopeModa
     category: "Daily Cosmos Forecast",
     icon: Sparkles,
     colorTheme: {
-      primary: "yellow-500",
+      textColor: "text-yellow-500",
       glow: "shadow-yellow-500/20",
       badge: "bg-yellow-500/10 text-yellow-400 border-yellow-500/20",
       bgGradient: "from-slate-950 via-slate-950 to-slate-900",
@@ -112,18 +112,9 @@ export default function HoroscopeModal({ isOpen, onClose, agent }: HoroscopeModa
       {isOpen && agent && data && (
         <div 
           id="horoscope-modal-container"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 md:p-10"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm cursor-pointer"
+          onClick={onClose}
         >
-          {/* Backdrop overlay */}
-          <motion.div
-            id="horoscope-modal-backdrop"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={onClose}
-            className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm cursor-pointer z-0"
-          />
-
           {/* Modal body container */}
           <motion.div
             id="horoscope-modal-content"
@@ -132,7 +123,7 @@ export default function HoroscopeModal({ isOpen, onClose, agent }: HoroscopeModa
             exit={{ opacity: 0, scale: 0.95, y: 15 }}
             transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
             onClick={(e) => e.stopPropagation()}
-            className={`relative w-full max-w-lg bg-gradient-to-b ${data.colorTheme.bgGradient} border border-slate-800 rounded-[2rem] shadow-2xl ${data.colorTheme.glow} p-6 sm:p-8 text-left overflow-hidden z-10 flex flex-col max-h-[90vh]`}
+            className={`relative w-full max-w-lg bg-gradient-to-b ${data.colorTheme.bgGradient} border border-slate-800 rounded-[2rem] shadow-2xl ${data.colorTheme.glow} p-6 sm:p-8 text-left overflow-hidden cursor-default flex flex-col max-h-[90vh]`}
           >
             {/* Subtle background cosmic elements */}
             <div className="absolute top-0 right-0 w-44 h-44 bg-gradient-to-br from-indigo-500/5 to-transparent rounded-full filter blur-2xl pointer-events-none" />
@@ -161,7 +152,7 @@ export default function HoroscopeModal({ isOpen, onClose, agent }: HoroscopeModa
               </div>
 
               <div className="pt-1">
-                <h2 className="text-xl sm:text-2xl font-serif font-bold text-yellow-101 text-yellow-100 tracking-tight leading-snug">
+                <h2 className="text-xl sm:text-2xl font-serif font-bold text-yellow-100 tracking-tight leading-snug">
                   {data.title}
                 </h2>
                 <div className="flex items-center gap-2 mt-1 px-0.5 text-[11px] text-slate-500 font-mono">
@@ -195,7 +186,7 @@ export default function HoroscopeModal({ isOpen, onClose, agent }: HoroscopeModa
 
               {/* Spiritual Sadhana / Ritual */}
               <div className="p-4 bg-slate-950/50 border border-slate-800/50 rounded-2xl flex gap-3">
-                <Sun className={`w-5 h-5 text-${data.colorTheme.primary} flex-shrink-0 mt-0.5`} />
+                <Sun className={`w-5 h-5 ${data.colorTheme.textColor} flex-shrink-0 mt-0.5`} />
                 <div className="space-y-1">
                   <h4 className="text-xs font-semibold text-slate-200">Suggested Daily Sadhana (Remedy)</h4>
                   <p className="text-xs text-slate-400 leading-relaxed font-light select-text">{data.ritual}</p>
