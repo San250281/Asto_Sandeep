@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { UserProfile, WalletTransaction, VoiceSession } from '../types';
+import { UserProfile, WalletTransaction, VoiceSession, ChatMessage } from '../types';
 
 const USER_STORAGE_KEY = 'astro_voice_user_profile';
 const TRANS_STORAGE_KEY = 'astro_voice_transactions';
@@ -67,6 +67,18 @@ export function getLocalSessions(): VoiceSession[] {
 
 export function saveLocalSessions(sessions: VoiceSession[]) {
   localStorage.setItem(SESS_STORAGE_KEY, JSON.stringify(sessions));
+}
+
+export function getLocalMessages(sessionId: string): ChatMessage[] {
+  const data = localStorage.getItem(`astro_messages_${sessionId}`);
+  if (!data) return [];
+  return JSON.parse(data);
+}
+
+export function saveLocalMessage(sessionId: string, message: ChatMessage) {
+  const messages = getLocalMessages(sessionId);
+  messages.push(message);
+  localStorage.setItem(`astro_messages_${sessionId}`, JSON.stringify(messages));
 }
 
 // Generate new random transaction ID

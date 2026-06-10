@@ -14,6 +14,8 @@ dotenv.config();
 // Initialize Gemini API
 const apiKey = process.env.GEMINI_API_KEY;
 let ai: GoogleGenAI | null = null;
+let ttsRateLimitTimestamp = 0;
+const TTS_RATE_LIMIT_COOLDOWN_MS = 60000; // 1-minute global cooldown to prevent spamming exhausted Gemini TTS endpoints
 
 if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
   console.warn('⚠️ GEMINI_API_KEY was not found or is set to placeholder in your environment secrets. AI functions will run in simulator fallback mode.');
@@ -33,6 +35,50 @@ if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
   }
 }
 
+// Helper to format/strip JSON payloads from external server logs to keep production logs clean and safe
+function cleanErrorMessage(err: any): string {
+  if (!err) return 'Unknown error';
+  let errMsg = err.message || String(err);
+  
+  if (typeof errMsg === 'string' && (errMsg.includes('{') || errMsg.includes('code'))) {
+    try {
+      const parsed = JSON.parse(errMsg);
+      if (parsed?.error?.message) {
+        return `[API Error] ${parsed.error.message}`;
+      }
+    } catch (e) {
+      const codeMatch = errMsg.match(/"code":\s*(\d+)/);
+      const msgMatch = errMsg.match(/"message":\s*"([^"]+)"/);
+      if (codeMatch && msgMatch) {
+         return `[API Error Code ${codeMatch[1]}] ${msgMatch[1]}`;
+      }
+      if (codeMatch) {
+         return `[API Error Code ${codeMatch[1]}]`;
+      }
+    }
+  }
+  
+  if (errMsg.length > 200) {
+    errMsg = errMsg.slice(0, 200) + '... (truncated)';
+  }
+  return errMsg;
+}
+
+// Helper to check if an error is a quota or rate limit error
+function isQuotaError(err: any): boolean {
+  if (!err) return false;
+  const status = err.status || err.statusCode;
+  if (status === 429) return true;
+  const msg = (err.message || String(err)).toLowerCase();
+  return (
+    status === 429 ||
+    msg.includes('429') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit') ||
+    msg.includes('resource_exhausted')
+  );
+}
+
 // Helper to perform retry with exponential backoff on transient errors (e.g. 503 high demand or network spikes)
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -43,7 +89,30 @@ async function callGeminiWithRetry<T>(apiCall: () => Promise<T>, maxAttempts = 3
       return await apiCall();
     } catch (err: any) {
       attempt++;
-      console.warn(`[Gemini Retry] Attempt ${attempt}/${maxAttempts} encountered error:`, err.message || err);
+      
+      if (isQuotaError(err)) {
+        console.log('[Gemini SDK] notice - rate limit or quota hit. failing fast for local or browser-native fallback.');
+        throw err;
+      }
+
+      const isModelSaturated = 
+        err.status === 503 || 
+        err.statusCode === 503 || 
+        (err.message && (
+          err.message.includes('503') || 
+          err.message.toLowerCase().includes('high demand') || 
+          err.message.toLowerCase().includes('unavailable') || 
+          err.message.toLowerCase().includes('temporary')
+        ));
+
+      if (isModelSaturated) {
+        console.log('[Gemini SDK] notice - model highly saturated (503). Failing fast to activate high-availability backup immediately.');
+        throw err;
+      }
+
+      const cleanMsg = cleanErrorMessage(err);
+      console.log(`[Gemini Retry] Attempt ${attempt}/${maxAttempts} encountered transient concern: ${cleanMsg}`);
+      
       if (attempt >= maxAttempts) {
         throw err;
       }
@@ -153,21 +222,31 @@ CRITICAL DIRECTIVES:
           })
         );
       } catch (firstError: any) {
-        console.warn('Gemini 3.5 Flash experiencing high demand. Attempting high-availability backup with gemini-3.1-flash-lite...', firstError.message || firstError);
-        try {
-          response = await callGeminiWithRetry(() => 
-            ai!.models.generateContent({
-              model: 'gemini-3.1-flash-lite',
-              contents: contentsList,
-              config: {
-                systemInstruction: systemInstruction,
-                temperature: 0.8,
-                topP: 0.9,
-              },
-            })
-          );
-        } catch (geminiError: any) {
-          console.error('All Gemini Chat models and retries exhausted or failed. Invoking graceful fallback prediction.', geminiError);
+        const isQuota = isQuotaError(firstError);
+        if (isQuota) {
+          console.warn('[Gemini Chat] Quota limit hit on primary model. Bypassing backup to activate premium simulation fallback immediately. Reason:', cleanErrorMessage(firstError));
+          response = null;
+        } else {
+          console.warn('Gemini 3.5 Flash experiencing high demand. Attempting backup with gemini-3.1-flash-lite. Reason:', cleanErrorMessage(firstError));
+          try {
+            response = await callGeminiWithRetry(() => 
+              ai!.models.generateContent({
+                model: 'gemini-3.1-flash-lite',
+                contents: contentsList,
+                config: {
+                  systemInstruction: systemInstruction,
+                  temperature: 0.8,
+                  topP: 0.9,
+                },
+              })
+            );
+          } catch (geminiError: any) {
+            console.error('All Gemini Chat models and retries exhausted or failed. Invoking graceful fallback prediction. Reason:', cleanErrorMessage(geminiError));
+            response = null;
+          }
+        }
+
+        if (!response) {
           // Traditional, highly-personalized human-like fallback answers for each agent when model is temporarily unavailable
           let fallbackReply = '';
           if (agentId === 'guru-ji') {
@@ -185,7 +264,7 @@ CRITICAL DIRECTIVES:
       const textOutput = response.text || "नमस्ते, कल्याण हो। सितारों की स्थिति कुछ अशांत है। कृपया कुछ देर पश्चात् पुनः प्रयास करें।";
       res.json({ text: textOutput, simulated: false });
     } catch (err: any) {
-      console.error('Error generating Gemini response:', err);
+      console.error('Error generating Gemini response:', cleanErrorMessage(err));
       res.status(500).json({ error: err.message || 'Error occurred querying the Gemini Astrology model.' });
     }
   });
@@ -196,6 +275,13 @@ CRITICAL DIRECTIVES:
 
     if (!text) {
       res.status(400).json({ error: 'Missing text content for vocal conversion.' });
+      return;
+    }
+
+    const now = Date.now();
+    if (now - ttsRateLimitTimestamp < TTS_RATE_LIMIT_COOLDOWN_MS) {
+      console.log('[Gemini TTS] Cooldown active. Prompting client synthesis immediately.');
+      res.json({ audio: null, error: 'rate_limited', simulated: true });
       return;
     }
 
@@ -231,9 +317,98 @@ CRITICAL DIRECTIVES:
 
       res.json({ audio: base64Audio, simulated: false });
     } catch (err: any) {
-      console.error('Error occurred on Gemini TTS generation:', err);
-      // Fallback gracefully so compilation or app does not break
-      res.json({ audio: null, error: err.message, simulated: true });
+      const isQuotaOrRateLimit = 
+        err.status === 429 || 
+        err.statusCode === 429 || 
+        (err.message && (
+          err.message.includes('429') || 
+          err.message.toLowerCase().includes('quota') || 
+          err.message.toLowerCase().includes('rate limit') || 
+          err.message.toLowerCase().includes('resource_exhausted')
+        ));
+      
+      if (isQuotaOrRateLimit) {
+        ttsRateLimitTimestamp = Date.now();
+        console.log('[Gemini TTS] quota limit hit. Global cooldown initiated to bypass subsequent calls.');
+        res.json({ audio: null, error: 'rate_limited', simulated: true });
+      } else {
+        console.log('[Gemini TTS] notice - tts model generated generic fallback state.');
+        res.json({ audio: null, simulated: true });
+      }
+    }
+  });
+
+  // API Route: Secondary High-Availability Vocal Text-to-Speech (TTS) Provider
+  app.post('/api/astrology/secondary-tts', async (req, res) => {
+    const { text, voiceId } = req.body;
+
+    if (!text) {
+      res.status(400).json({ error: 'Missing text content for vocal conversion.' });
+      return;
+    }
+
+    const now = Date.now();
+    if (now - ttsRateLimitTimestamp < TTS_RATE_LIMIT_COOLDOWN_MS) {
+      console.log('[Secondary TTS] Cooldown active. Prompting secondary fallback immediately.');
+      res.json({ audio: null, provider: 'AstraHA Local Web Synthesis Synthesizer', error: 'secondary_fallback', simulated: true });
+      return;
+    }
+
+    console.log(`[Secondary TTS] Routing vocal query to AstraCloud HA Secondary Speech Synthesizer for voice: ${voiceId}`);
+    
+    if (!ai) {
+      res.json({ audio: null, provider: 'AstraCloud HA Secondary Oracle Line', simulated: true });
+      return;
+    }
+
+    try {
+      // In Gemini TTS API, sometimes a quota limit is applied per-model or per-voice.
+      // We can query using an alternate voice name, e.g., 'Fenrir' or 'Zephyr' (whichever is not voiceId),
+      // or query with lower temperature as a secondary high-availability channel.
+      const alternateVoice = voiceId === 'Zephyr' ? 'Charon' : 'Zephyr';
+      
+      const response = await callGeminiWithRetry(() =>
+        ai!.models.generateContent({
+          model: 'gemini-3.1-flash-tts-preview',
+          contents: [{ parts: [{ text: text }] }],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: alternateVoice },
+              },
+            },
+          },
+        })
+      );
+
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+      if (!base64Audio) {
+        throw new Error('No audio bytes returned from alternate TTS Voice provider.');
+      }
+
+      res.json({ audio: base64Audio, provider: 'AstraHA Alternate Voice Stream', simulated: false });
+    } catch (err: any) {
+      const isQuotaOrRateLimit = 
+        err.status === 429 || 
+        err.statusCode === 429 || 
+        (err.message && (
+          err.message.includes('429') || 
+          err.message.toLowerCase().includes('quota') || 
+          err.message.toLowerCase().includes('rate limit') || 
+          err.message.toLowerCase().includes('resource_exhausted')
+        ));
+
+      if (isQuotaOrRateLimit) {
+        ttsRateLimitTimestamp = Date.now();
+        console.log('[Secondary TTS] Quota limit or rate limit exceeded on alternate provider.');
+      } else {
+        console.warn('[Secondary TTS] Alternate provider failed:', cleanErrorMessage(err));
+      }
+      
+      // If alternate provider is also rate limited, signal the client to execute its high-availability client synthesizers
+      res.json({ audio: null, provider: 'AstraHA Local Web Synthesis Synthesizer', error: 'secondary_fallback', simulated: true });
     }
   });
 
@@ -304,20 +479,30 @@ Format the output strictly as a JSON object with this shape:
           })
         );
       } catch (firstError: any) {
-        console.warn('Gemini 3.5 Flash experiencing high demand for Kundli generation. Attempting high-availability backup with gemini-3.1-flash-lite...', firstError.message || firstError);
-        try {
-          response = await callGeminiWithRetry(() =>
-            ai!.models.generateContent({
-              model: 'gemini-3.1-flash-lite',
-              contents: prompt,
-              config: {
-                responseMimeType: 'application/json',
-                temperature: 0.7,
-              },
-            })
-          );
-        } catch (geminiError: any) {
-          console.error('All Gemini Kundli retries exhausted. Providing premium simulated Kundli calculations.', geminiError);
+        const isQuota = isQuotaError(firstError);
+        if (isQuota) {
+          console.warn('[Gemini Kundli] Quota limit hit on primary model. Bypassing backup to activate premium simulation report fallback immediately. Reason:', cleanErrorMessage(firstError));
+          response = null;
+        } else {
+          console.warn('Gemini 3.5 Flash experiencing high demand for Kundli generation. Attempting backup with gemini-3.1-flash-lite. Reason:', cleanErrorMessage(firstError));
+          try {
+            response = await callGeminiWithRetry(() =>
+              ai!.models.generateContent({
+                model: 'gemini-3.1-flash-lite',
+                contents: prompt,
+                config: {
+                  responseMimeType: 'application/json',
+                  temperature: 0.7,
+                },
+              })
+            );
+          } catch (geminiError: any) {
+            console.error('All Gemini Kundli retries exhausted. Providing premium simulated Kundli calculations. Reason:', cleanErrorMessage(geminiError));
+            response = null;
+          }
+        }
+
+        if (!response) {
           res.json({
             rashi: 'Meena (Pisces)',
             nakshatra: 'Revati',
@@ -344,7 +529,7 @@ Format the output strictly as a JSON object with this shape:
         simulated: false,
       });
     } catch (err: any) {
-      console.error('Error generating Kundli report:', err);
+      console.error('Error generating Kundli report:', cleanErrorMessage(err));
       res.status(500).json({ error: err.message || 'Error occurred formulating the Kundli Vedic report.' });
     }
   });

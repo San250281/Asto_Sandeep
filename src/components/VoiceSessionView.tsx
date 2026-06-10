@@ -6,7 +6,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Mic, MicOff, PhoneOff, Compass, Sparkles, Volume2, ShieldAlert, MessageCircle, RefreshCw } from 'lucide-react';
 import { AstrologerAgent, UserProfile, WalletTransaction, ChatMessage, VoiceSession } from '../types';
-import { generateId } from '../services/billing';
+import { generateId, saveLocalMessage } from '../services/billing';
+import { addFirestoreMessage } from '../services/firestoreService';
 
 interface VoiceSessionViewProps {
   agent: AstrologerAgent;
@@ -42,7 +43,7 @@ export default function VoiceSessionView({
   const [sessionActive, setSessionActive] = useState(true);
   const [duration, setDuration] = useState(0);
   const [cost, setCost] = useState(0);
-  const [micActive, setMicActive] = useState(false);
+  const [micActive, setMicActive] = useState(true);
   const [botSpeaking, setBotSpeaking] = useState(false);
   const [userSpeaking, setUserSpeaking] = useState(false);
   
@@ -55,6 +56,12 @@ export default function VoiceSessionView({
   // Statuses/errors
   const [statusMsg, setStatusMsg] = useState<string>('Connected & active. Speak anytime.');
   const [showLowBalanceWarning, setShowLowBalanceWarning] = useState(false);
+  const [rateLimitState, setRateLimitState] = useState<{
+    isActive: boolean;
+    text: string;
+    attempts: number;
+    fallbackProviderActive: boolean;
+  } | null>(null);
 
   // References to preserve state throughout the per-second render hooks
   const userRef = useRef<UserProfile>(user);
@@ -62,6 +69,38 @@ export default function VoiceSessionView({
   const recognitionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const transcriptRef = useRef<string>('');
+  const micActiveRef = useRef<boolean>(micActive);
+  const botSpeakingRef = useRef<boolean>(botSpeaking);
+  const sessionActiveRef = useRef<boolean>(sessionActive);
+
+  // Helper to persist conversation transcript messages
+  const persistMessageDirectly = async (sessionId: string, sender: 'user' | 'ai', text: string) => {
+    const msg: ChatMessage = {
+      id: generateId('msg'),
+      session_id: sessionId,
+      sender,
+      text,
+      timestamp: new Date().toISOString(),
+    };
+
+    const isSimulated = localStorage.getItem('is_simulated_mode') === 'true';
+    if (isSimulated) {
+      saveLocalMessage(sessionId, msg);
+    } else {
+      try {
+        await addFirestoreMessage(user.uid, sessionId, msg);
+      } catch (e) {
+        console.warn('Failed to save message to Firestore, fallback to local storage:', e);
+        saveLocalMessage(sessionId, msg);
+      }
+    }
+  };
+
+  const persistMessage = async (sender: 'user' | 'ai', text: string) => {
+    if (!activeSessionRef.current) return;
+    await persistMessageDirectly(activeSessionRef.current.id, sender, text);
+  };
   
   const pricePerSec = agent.price_per_minute / 60;
 
@@ -69,6 +108,19 @@ export default function VoiceSessionView({
   useEffect(() => {
     userRef.current = user;
   }, [user]);
+
+  // Sync state values to references to prevent stale closures
+  useEffect(() => {
+    micActiveRef.current = micActive;
+  }, [micActive]);
+
+  useEffect(() => {
+    botSpeakingRef.current = botSpeaking;
+  }, [botSpeaking]);
+
+  useEffect(() => {
+    sessionActiveRef.current = sessionActive;
+  }, [sessionActive]);
 
   // Clean-up on unmount
   useEffect(() => {
@@ -105,11 +157,12 @@ export default function VoiceSessionView({
     activeSessionRef.current = newSession;
     onUpdateSessions([newSession, ...sessions]);
 
+    const initialGreeting = `Welcome, my seeker. I am ${agent.name}. Tell me what your natal geometry reveals today.`;
     // Speak initial greeting vocalization
-    speakAudio(`Welcome, my seeker. I am ${agent.name}. Tell me what your natal geometry reveals today.`);
+    speakAudio(initialGreeting);
 
-    // Spawn microphone listener automatically
-    startMicrophoneCapture();
+    // Save initial greeting to transcript
+    persistMessageDirectly(sessId, 'ai', initialGreeting);
   }, [agent]);
 
   // Per-Second Continuous Billing Thread
@@ -302,65 +355,171 @@ export default function VoiceSessionView({
     }
   };
 
-  // Voice Speech Synthesizer
-  const speakAudio = async (textToSpeak: string) => {
+  // Setup Rate Limit and Fallback Handler
+  const handleTtsRateLimitation = async (textToSpeak: string) => {
+    console.warn('[TTS Rate Limit] Gemini API rate limit or quota exceeded. Initiating graceful fallback options.');
+    setBotSpeaking(false);
+    
+    setRateLimitState({
+      isActive: true,
+      text: textToSpeak,
+      attempts: 1,
+      fallbackProviderActive: false,
+    });
+    
+    setStatusMsg('Primary voice channel congested. Automatically switching to recovery line...');
+    const secondarySucceeded = await speakSecondaryTts(textToSpeak);
+    if (secondarySucceeded) {
+      setRateLimitState(null);
+    }
+  };
+
+  const speakSecondaryTts = async (textToSpeak: string) => {
     try {
-      setBotSpeaking(true);
-      setStatusMsg('Astrologer is speaking...');
+      setStatusMsg('Streaming voice synthesis via AstraHA Secondary Channel...');
+      setRateLimitState(prev => prev ? { ...prev, fallbackProviderActive: true } : null);
+      
+      const response = await fetch('/api/astrology/secondary-tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: textToSpeak, voiceId: agent.voice_id }),
+      });
 
-      // Suspend voice recognition during speech outputs to prevent bot feedback loop
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch (e) {}
+      if (response.ok) {
+        const speechData = await response.json();
+        if (speechData && speechData.audio) {
+          setBotSpeaking(true);
+          playPcmAudio(speechData.audio);
+          setRateLimitState(null);
+          return true;
+        }
       }
+    } catch (err) {
+      console.error('[Secondary TTS Fail] Switching to browser vocal fallback:', err);
+    }
+    
+    // Default to Browser TTS if secondary provider failed as a fallback of fallback
+    setRateLimitState(null);
+    speakBrowserTtsFallback(textToSpeak);
+    return false;
+  };
 
-      // Try Server-Side Gemini Speech synthesis (Premium Cloned Voice replica)
+  const retryPrimaryTts = async (textToSpeak: string) => {
+    try {
+      setStatusMsg('Retrying connection to primary celestial voice lines...');
+      setRateLimitState(prev => prev ? { ...prev, attempts: prev.attempts + 1 } : null);
+      
       const response = await fetch('/api/astrology/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: textToSpeak, voiceId: agent.voice_id }),
       });
 
-      const speechData = await response.json();
+      if (response.ok) {
+        const speechData = await response.json();
+        if (speechData) {
+          if (speechData.error === 'rate_limited') {
+            setStatusMsg('Primary voice lines still congested. Please try the secondary line or click retry again.');
+            return false;
+          } else if (speechData.audio && !speechData.simulated) {
+            setBotSpeaking(true);
+            playPcmAudio(speechData.audio);
+            setRateLimitState(null);
+            return true;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Primary retry failed:', err);
+    }
+    return false;
+  };
 
-      if (speechData.audio && !speechData.simulated) {
-        playPcmAudio(speechData.audio);
+  const speakBrowserTtsFallback = (textToSpeak: string) => {
+    setBotSpeaking(true);
+    try {
+      if (window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+    } catch (e) {
+      console.warn('Speech synthesis cancel failed:', e);
+    }
+
+    const synthesisUtterance = new SpeechSynthesisUtterance(textToSpeak);
+    
+    if (agent.id === 'guru-ji') {
+      synthesisUtterance.rate = 0.85;
+      synthesisUtterance.pitch = 0.8;
+    } else if (agent.id === 'love-expert') {
+      synthesisUtterance.rate = 0.95; 
+      synthesisUtterance.pitch = 1.1;
+    } else {
+      synthesisUtterance.rate = 1.05;
+      synthesisUtterance.pitch = 0.95;
+    }
+
+    synthesisUtterance.onend = () => {
+      setBotSpeaking(false);
+      setStatusMsg('Active listening mode. Speak now.');
+    };
+
+    synthesisUtterance.onerror = (e) => {
+      console.warn('Web Speech Synthesis experienced block. Showing text below.', e);
+      setBotSpeaking(false);
+      setStatusMsg('Oracle response displayed below. Ask your next question!');
+    };
+
+    try {
+      window.speechSynthesis.speak(synthesisUtterance);
+    } catch (speakErr) {
+      console.warn('Direct execution of SpeechSynthesis failed:', speakErr);
+      setBotSpeaking(false);
+      setStatusMsg('Celestial wisdom decoded! Ask your next question below:');
+    }
+  };
+
+  // Voice Speech Synthesizer
+  const speakAudio = async (textToSpeak: string) => {
+    try {
+      setBotSpeaking(true);
+      setStatusMsg('Astrologer is speaking...');
+
+      let hasVocalGenerated = false;
+      let isRateLimited = false;
+
+      try {
+        // Try Server-Side Gemini Speech synthesis
+        const response = await fetch('/api/astrology/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: textToSpeak, voiceId: agent.voice_id }),
+        });
+
+        if (response.ok) {
+          const speechData = await response.json();
+          if (speechData) {
+            if (speechData.error === 'rate_limited') {
+              isRateLimited = true;
+            } else if (speechData.audio && !speechData.simulated) {
+              playPcmAudio(speechData.audio);
+              hasVocalGenerated = true;
+            }
+          }
+        } else if (response.status === 429) {
+          isRateLimited = true;
+        }
+      } catch (ttsErr) {
+        console.warn('Server-side Gemini TTS request failed:', ttsErr);
+      }
+
+      if (isRateLimited) {
+        handleTtsRateLimitation(textToSpeak);
         return;
       }
 
-      // If key is absent, use browser's native SpeechSynthesis fallback
-      const synthesisUtterance = new SpeechSynthesisUtterance(textToSpeak);
-      
-      // Fine-tune tone parameters based on requested astrologer personalities
-      if (agent.id === 'guru-ji') {
-        synthesisUtterance.rate = 0.85; // Wise, slower pace
-        synthesisUtterance.pitch = 0.8; // Deep guru voice
-      } else if (agent.id === 'love-expert') {
-        synthesisUtterance.rate = 0.95; 
-        synthesisUtterance.pitch = 1.1; // Supportive female pitch
-      } else {
-        synthesisUtterance.rate = 1.05; // Quick strategical pitch
-        synthesisUtterance.pitch = 0.95;
+      if (!hasVocalGenerated) {
+        speakBrowserTtsFallback(textToSpeak);
       }
-
-      synthesisUtterance.onend = () => {
-        setBotSpeaking(false);
-        setStatusMsg('Active listening mode. Speak now.');
-        // Resume listening
-        if (micActive && recognitionRef.current) {
-          try {
-            recognitionRef.current.start();
-          } catch (e) {}
-        }
-      };
-
-      synthesisUtterance.onerror = (e) => {
-        console.error('Web Speech Synthesis error:', e);
-        setBotSpeaking(false);
-      };
-
-      window.speechSynthesis.speak(synthesisUtterance);
     } catch (e) {
       console.warn('System sound synthesis aborted. Bot speaking reverted to visual text.');
       setBotSpeaking(false);
@@ -372,7 +531,9 @@ export default function VoiceSessionView({
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      setStatusMsg('Speech recognition API not supported in this frame. Type instead below!');
+      const errorMsg = 'Your browser / web container does not natively support standard SpeechRecognition. Please type your query in the console below!';
+      console.warn('[STT Error]', errorMsg);
+      setStatusMsg(errorMsg);
       return;
     }
 
@@ -383,7 +544,8 @@ export default function VoiceSessionView({
 
     recInstance.onstart = () => {
       setMicActive(true);
-      setStatusMsg('Listening to your coordinates...');
+      setStatusMsg('Listening deeply to your voice... Speak your question.');
+      console.log('🎙️ Microphone capture active & web speech service successfully initialized.');
     };
 
     recInstance.onresult = (event: any) => {
@@ -393,32 +555,50 @@ export default function VoiceSessionView({
         .map((res) => res.transcript)
         .join('');
 
+      transcriptRef.current = outputSpeech;
       setCurrentTranscript(outputSpeech);
     };
 
     recInstance.onerror = (event: any) => {
-      console.warn('Speech Recognition feedback error:', event.error);
-      if (event.error === 'not-allowed') {
-        setStatusMsg('Microphone blocked. Uncheck blocked frame rules or allow access.');
-        setMicActive(false);
-      }
+      console.warn('[STT Error] Speech Recognition feedback error:', event.error);
       setUserSpeaking(false);
+
+      if (event.error === 'not-allowed') {
+        setStatusMsg('Microphone blocked. Please grant microphone access permissions in your browser or iframe.');
+        setMicActive(false);
+      } else if (event.error === 'network') {
+        setStatusMsg('Astra Voice Line network interruption. Reconnecting automatically...');
+      } else if (event.error === 'no-speech') {
+        // No action needed, standard quiet period warning
+        setStatusMsg('Listening for coordinates... Speak clearly.');
+      } else if (event.error === 'audio-capture') {
+        setStatusMsg('No audio interface found. Check that your microphone is plugged in and working.');
+        setMicActive(false);
+      } else {
+        setStatusMsg(`Voice pipeline issue (${event.error}). Please type your query instead.`);
+      }
     };
 
     recInstance.onend = () => {
       setUserSpeaking(false);
       
+      const textToProcess = transcriptRef.current;
+
       // If mic is still globally activated and user finished their statement, trigger calculations!
-      if (currentTranscript.trim()) {
-        processUserAstrologyQuery(currentTranscript);
+      if (textToProcess && textToProcess.trim()) {
+        console.log(`🎙️ Transcription finalized: "${textToProcess}". Dispatching to Gemini Astro Oracle.`);
+        transcriptRef.current = '';
         setCurrentTranscript('');
-      } else if (micActive && !botSpeaking) {
+        processUserAstrologyQuery(textToProcess);
+      } else if (micActiveRef.current && !botSpeakingRef.current) {
         // Keep active looping state alive without crashing
         setTimeout(() => {
-          if (micActive && !botSpeaking && sessionActive) {
+          if (micActiveRef.current && !botSpeakingRef.current && sessionActiveRef.current) {
             try {
               recognitionRef.current.start();
-            } catch (e) {}
+            } catch (e) {
+              console.debug('Failed to auto-restart speech recognition loop:', e);
+            }
           }
         }, 500);
       }
@@ -428,7 +608,9 @@ export default function VoiceSessionView({
     
     try {
       recInstance.start();
-    } catch (e) {}
+    } catch (e) {
+      console.error('Failed to trigger native speech recognition startup:', e);
+    }
   };
 
   const toggleMicrophoneControl = () => {
@@ -447,9 +629,44 @@ export default function VoiceSessionView({
     }
   };
 
+  // Synchronous self-healing physical browser microphone state manager
+  useEffect(() => {
+    if (!sessionActive) {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch (err) {}
+      }
+      return;
+    }
+
+    const shouldListen = micActive && !botSpeaking && (!rateLimitState || !rateLimitState.isActive);
+
+    if (shouldListen) {
+      if (!recognitionRef.current) {
+        startMicrophoneCapture();
+      } else {
+        try {
+          recognitionRef.current.start();
+        } catch (e) {
+          // It might already be running, ignore standard start exception
+        }
+      }
+    } else {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch (e) {}
+      }
+    }
+  }, [micActive, botSpeaking, rateLimitState, sessionActive]);
+
   // Core dialog dispatcher: sends audio transcript text to backend Gemini astrology agent
   const processUserAstrologyQuery = async (queryText: string) => {
     if (!queryText.trim()) return;
+
+    // Halt active microphone loops during processing & contemplation
+    setBotSpeaking(true);
 
     setStatusMsg(`${agent.name} ध्यानपूर्वक सुन रहे हैं... (${agent.name} is listening deeply...)`);
 
@@ -457,6 +674,9 @@ export default function VoiceSessionView({
     const formattedDuration = `${Math.floor(duration / 60)}:${(duration % 60).toString().padStart(2, '0')}`;
     const userMsgNode = { sender: 'user' as const, text: queryText, time: formattedDuration };
     setDialogFeed((prev) => [...prev, userMsgNode]);
+    
+    // Persist user question script
+    persistMessage('user', queryText);
 
     const startTime = Date.now();
 
@@ -503,7 +723,11 @@ export default function VoiceSessionView({
       // Append bot response and speak aloud
       setDialogFeed((prev) => [...prev, { sender: 'ai' as const, text: botResponse, time: formattedDuration }]);
       speakAudio(botResponse);
+
+      // Persist AI response script
+      persistMessage('ai', botResponse);
     } catch (error: any) {
+      setBotSpeaking(false);
       setStatusMsg('किन्हीं कारणों से गणना स्पष्ट नहीं है। कृपया पुनः प्रयास करें। (Failed to process. Please retry.)');
       console.error(error);
     }
@@ -625,6 +849,52 @@ export default function VoiceSessionView({
           </div>
         ))}
       </div>
+
+      {/* RATE LIMIT INTERACTIVE OVERLAY WITH RECOVERY ACTIONS */}
+      {rateLimitState && rateLimitState.isActive && (
+        <div className="mb-4 bg-yellow-500/10 border border-yellow-500/30 text-yellow-101 p-3.5 rounded-2xl text-xs flex flex-col gap-3 animate-pulse">
+          <div className="flex items-start gap-2.5">
+            <RefreshCw className="w-5 h-5 text-yellow-400 mt-0.5 animate-spin flex-shrink-0" />
+            <div className="flex-1">
+              <span className="font-bold block text-yellow-300 text-[11px] uppercase tracking-wider mb-0.5">Celestial Voice channel congested (429 Rate Limit)</span>
+              <p className="text-[10px] text-slate-300 leading-relaxed">
+                Primary channels are currently crowded (rate limited). Switch to our High-Availability secondary line, try to reconnect, or stream via standard web synthesis.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center justify-end gap-2 text-[10px]">
+            <button
+              type="button"
+              onClick={() => retryPrimaryTts(rateLimitState.text)}
+              className="px-2.5 py-1 bg-yellow-500/10 border border-yellow-500/20 text-yellow-300 rounded hover:bg-yellow-500/20 active:scale-95 transition-all font-mono font-bold cursor-pointer"
+              disabled={rateLimitState.fallbackProviderActive}
+            >
+              Retry Primary ({rateLimitState.attempts})
+            </button>
+            <button
+              type="button"
+              onClick={() => speakSecondaryTts(rateLimitState.text)}
+              className="px-2.5 py-1 bg-yellow-500 text-slate-950 rounded hover:bg-yellow-400 active:scale-95 transition-all font-bold flex items-center gap-1 cursor-pointer"
+            >
+              {rateLimitState.fallbackProviderActive ? (
+                <>Connecting... <RefreshCw className="w-3 h-3 animate-spin" /></>
+              ) : (
+                <>Switch to Secondary Line <Sparkles className="w-3 h-3" /></>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setRateLimitState(null);
+                speakBrowserTtsFallback(rateLimitState.text);
+              }}
+              className="px-2.5 py-1 bg-slate-900 border border-slate-800 text-slate-400 rounded hover:bg-slate-850 active:scale-95 transition-all cursor-pointer"
+            >
+              Web Speech Fallback
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Danger & Low Balance warning popup overlays */}
       {showLowBalanceWarning && (
